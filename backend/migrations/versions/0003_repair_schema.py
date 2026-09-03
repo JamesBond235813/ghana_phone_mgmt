@@ -1,0 +1,22 @@
+"""add repair workflow tables
+
+Revision ID: 0003_repair_schema
+Revises: 0002_logistics_sales_schema
+"""
+from alembic import op
+
+revision = "0003_repair_schema"
+down_revision = "0002_logistics_sales_schema"
+branch_labels = None
+depends_on = None
+
+
+def upgrade() -> None:
+    from app.db import models  # noqa: F401
+    from app.db.base import Base
+
+    Base.metadata.create_all(bind=op.get_bind())
+
+
+def downgrade() -> None:
+    pass

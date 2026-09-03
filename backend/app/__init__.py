@@ -1,0 +1,1 @@
+"""Ghana phone management backend."""

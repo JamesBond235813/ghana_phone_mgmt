@@ -1,0 +1,40 @@
+from enum import StrEnum
+
+
+class PermissionCode(StrEnum):
+    PHONE_VIEW = "phone:view"
+    PHONE_EDIT = "phone:edit"
+    TRAY_MANAGE = "tray:manage"
+    BOX_MANAGE = "box:manage"
+    PURCHASE_CREATE = "purchase:create"
+    SHIPMENT_DISPATCH = "shipment:dispatch"
+    SHIPMENT_VIEW = "shipment:view"
+    RECEIVING_ACCEPT = "receiving:accept"
+    RECEIVING_UNPACK = "receiving:unpack"
+    TRANSFER_CREATE = "transfer:create"
+    TRANSFER_RECEIVE = "transfer:receive"
+    INVENTORY_ISSUE = "inventory:issue"
+    INVENTORY_RECEIVE = "inventory:receive"
+    SALES_CREATE = "sales:create"
+    SALES_APPROVE = "sales:approve"
+    SALES_CANCEL = "sales:cancel"
+    RETURN_CREATE = "return:create"
+    RETURN_RECEIVE = "return:receive"
+    REPAIR_CREATE = "repair:create"
+    REPAIR_RECEIVE = "repair:receive"
+    REPAIR_UPDATE = "repair:update"
+    REPAIR_APPROVE = "repair:approve"
+    STOCKTAKE_SUBMIT = "stocktake:submit"
+    STOCKTAKE_ADJUST = "stocktake:adjust"
+    REPORT_VIEW = "report:view"
+    AUDIT_VIEW = "audit:view"
+    USER_MANAGE = "user:manage"
+    ROLE_MANAGE = "role:manage"
+
+
+class ScopeKind(StrEnum):
+    ALL = "all"
+    COUNTRY = "country"
+    ORGANIZATION = "organization"
+    LOCATION = "location"
+    OWN = "own"
