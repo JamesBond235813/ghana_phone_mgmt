@@ -5,7 +5,9 @@ import sqlalchemy as sa
 
 
 revision = "0011_normalize_role_display_names"
-down_revision = "0010_ghana_role_dispatch_boundary"
+# Keep this identifier aligned with the revision declared by
+# 0010_ghana_role_dispatch_boundary.py.
+down_revision = "0010_ghana_dispatch_boundary"
 branch_labels = None
 depends_on = None
 
@@ -26,6 +28,15 @@ ROLE_NAMES = {
 
 def upgrade() -> None:
     bind = op.get_bind()
+    # Alembic creates this bookkeeping column as VARCHAR(32) by default;
+    # this revision id is longer than that on MySQL.
+    op.alter_column(
+        "alembic_version",
+        "version_num",
+        existing_type=sa.String(length=32),
+        type_=sa.String(length=255),
+        existing_nullable=False,
+    )
     for code, name in ROLE_NAMES.items():
         bind.execute(
             sa.text("UPDATE roles SET name = :name WHERE code = :code"),
