@@ -6,7 +6,9 @@ import { acceptRepair, adjustStocktake, beginOperation, changePassword, confirmS
 import { ArrowLeftRight, Box, CheckCircle2, ClipboardCheck, FileText, House, PackageOpen, RotateCcw, ScanLine, Search, Send, Settings, ShoppingCart, Warehouse, Wrench } from '@lucide/vue'
 
 type ScanItem = { value: string; time: string; result: '待提交' | '成功' }
-type Task = { title: string; hint: string; icon: any; permission: string | string[]; mode: 'imei' | 'container'; action: string }
+type WorkflowKey = 'shenzhen' | 'ghana'
+type WorkflowStep = { key: string; label: string; hint: string; action: string; phase: string; permission: string }
+type Task = { title: string; hint: string; icon: any; permission: string | string[]; mode: 'imei' | 'container'; action: string; workflow?: WorkflowKey }
 
 const user = ref<CurrentUser | null>(null)
 const loading = ref(false)
@@ -19,6 +21,10 @@ const password = ref('')
 const code = ref('')
 const smsSent = ref(false)
 const activeTask = ref<Task | null>(null)
+// A workflow groups the steps that are performed by one physical operator.
+// activeTask remains the existing API task so all endpoint payloads and draft
+// replay behaviour stay unchanged.
+const activeWorkflow = ref<WorkflowKey | null>(null)
 const manualValue = ref('')
 const scanItems = ref<ScanItem[]>([])
 const cameraError = ref('')
@@ -26,6 +32,7 @@ const operationMessage = ref('')
 const organizationId = ref('')
 const locationId = ref('')
 const containerCode = ref('')
+const capturingContainer = ref(false)
 const targetTrayCode = ref('')
 const targetBoxCode = ref('')
 const containerKind = ref<'PHONE' | 'TRAY' | 'BOX'>('BOX')
@@ -62,12 +69,20 @@ const adminData = ref<{ organizations: Record<string, unknown>[]; locations: Rec
 const adminTab = ref<'users' | 'organizations' | 'locations' | 'roles' | 'audits'>('users')
 const orgCode = ref(''); const orgName = ref(''); const orgCountry = ref('')
 const locOrganizationId = ref(''); const locCode = ref(''); const locName = ref(''); const locType = ref('store')
-const roleCode = ref(''); const roleName = ref(''); const selectedRolePermissions = ref<string[]>([])
+const roleCode = ref(''); const roleName = ref(''); const roleWorkGroup = ref(''); const roleDescription = ref(''); const selectedRolePermissions = ref<string[]>([])
 const newUserIdentifier = ref(''); const newUserName = ref(''); const newUserPassword = ref(''); const newUserRoleIds = ref<number[]>([]); const newUserScopes = ref('')
 // 兼容模板中的旧字段绑定；表单现在同时接受手机号和英文用户名。
 const newUserPhone = newUserIdentifier
 const editingUserId = ref<number | null>(null); const editingUserRoleIds = ref<number[]>([]); const editingUserScopes = ref('')
 const workLocations = ref<Record<string, unknown>[]>([])
+// A generated receiving/return number follows the operator when the
+// workflow stepper switches to the next underlying task.
+const workflowDocuments = ref<Record<string, string>>({})
+const roleLabel = computed(() => {
+  const first = user.value?.roles?.[0]
+  if (typeof first === 'string') return first
+  return first?.name || user.value?.work_group || ''
+})
 const video = ref<HTMLVideoElement | null>(null)
 const scanning = ref(false)
 let stream: MediaStream | null = null
@@ -88,9 +103,73 @@ const tasks: Task[] = [
   { title: '盘点核查', hint: '盘点与差异处理', icon: ScanLine, permission: ['stocktake:submit', 'stocktake:adjust'], mode: 'imei', action: 'stocktake' },
   { title: '查询手机', hint: 'IMEI 全程轨迹', icon: Search, permission: 'phone:view', mode: 'imei', action: 'query' }
 ]
+const workflowTasks: Task[] = [
+  { title: '深圳收购仓作业', hint: '收购验收 → 装托盘 → 装箱封存', icon: PackageOpen, permission: ['purchase:create', 'tray:manage', 'box:manage'], mode: 'imei', action: 'workflow_shenzhen', workflow: 'shenzhen' },
+  { title: '加纳综合仓作业', hint: '到货验收 → 拣货调拨 → 退回分诊 → 维修建单/QA', icon: Warehouse, permission: ['receiving:unpack', 'receiving:accept', 'transfer:create', 'return:receive', 'repair:create', 'repair:approve'], mode: 'imei', action: 'workflow_ghana', workflow: 'ghana' },
+]
+const workflowDefinitions: Record<WorkflowKey, WorkflowStep[]> = {
+  shenzhen: [
+    { key: 'purchase', label: '收购验收', hint: '逐台录入 IMEI，生成采购入库单', action: 'purchase', phase: 'create', permission: 'purchase:create' },
+    { key: 'tray', label: '装入托盘', hint: '先录托盘编码，再连续扫手机', action: 'tray', phase: 'create', permission: 'tray:manage' },
+    { key: 'box', label: '装箱封存', hint: '扫描托盘编码，完成箱内装载', action: 'box', phase: 'create', permission: 'box:manage' },
+  ],
+  ghana: [
+    { key: 'receiving-start', label: '建立到货单', hint: '按发运单开箱登记', action: 'receiving', phase: 'start', permission: 'receiving:unpack' },
+    { key: 'receiving-inspect', label: '逐台到货验收', hint: '逐台核对并可重新装托/装箱', action: 'receiving', phase: 'inspect', permission: 'receiving:accept' },
+    { key: 'transfer-issue', label: '门店拣货调拨', hint: '按手机、托盘或箱子发往门店', action: 'transfer', phase: 'issue', permission: 'transfer:create' },
+    { key: 'transfer-receive', label: '调拨收货', hint: '门店或管理处核对实收', action: 'transfer', phase: 'receive', permission: 'transfer:receive' },
+    { key: 'return-create', label: '发起退回', hint: '登记门店待维修手机/托盘', action: 'return', phase: 'create', permission: 'return:create' },
+    { key: 'return-receive', label: '退回分诊', hint: '接收退回箱/托盘，逐台登记', action: 'return', phase: 'receive', permission: 'return:receive' },
+    { key: 'repair-create', label: '建立维修单', hint: '把待修手机或容器送入维修队列', action: 'repair', phase: 'create', permission: 'repair:create' },
+    { key: 'repair-accept', label: '维修接收', hint: '维修人员接收任务（如有授权）', action: 'repair', phase: 'accept', permission: 'repair:receive' },
+    { key: 'repair-complete', label: '填写维修结果', hint: '逐台记录维修结果（如有授权）', action: 'repair', phase: 'complete', permission: 'repair:update' },
+    { key: 'repair-review', label: '维修 QA 复核', hint: '逐台确认恢复可售、冻结或报损', action: 'repair', phase: 'review', permission: 'repair:approve' },
+  ],
+}
+const underlyingTask = (action: string) => tasks.find((task) => task.action === action) || null
+function metadataWorkflow(): WorkflowKey | null {
+  const raw = user.value
+  if (!raw) return null
+  const value = String(raw.work_group || '').trim().toLowerCase()
+  if (['shenzhen', 'sz', 'shenzhen_operations', 'sz_operations', 'demo_sz_operations', '深圳综合作业'].includes(value)) return 'shenzhen'
+  if (['ghana', 'gh', 'ghana_operations', 'demo_ghana_operations', '加纳综合作业'].includes(value)) return 'ghana'
+  const codes = (Array.isArray(raw.role_codes) ? raw.role_codes : [])
+    .concat(Array.isArray(raw.roles) ? raw.roles.map((row) => typeof row === 'string' ? row : row.code || '') : [])
+    .map((code) => String(code).toLowerCase())
+  if (codes.includes('demo_sz_operations')) return 'shenzhen'
+  if (codes.includes('demo_ghana_operations')) return 'ghana'
+  return null
+}
+function workflowCapabilityReady(workflow: WorkflowKey) {
+  // Require the core capabilities that identify the merged岗位. Partial or
+  // legacy roles keep their original granular入口 instead of losing access.
+  const required = workflow === 'shenzhen'
+    ? ['purchase:create', 'tray:manage', 'box:manage']
+    : ['receiving:unpack', 'receiving:accept', 'transfer:create', 'return:receive', 'repair:create', 'repair:approve']
+  const hasRequired = required.every((code) => hasPermission(user.value, code))
+  const metadata = metadataWorkflow()
+  return metadata ? metadata === workflow && hasRequired : hasRequired
+}
+const workflowSteps = computed(() => activeWorkflow.value ? workflowDefinitions[activeWorkflow.value].filter((step) => hasPermission(user.value, step.permission)) : [])
+const currentWorkflowStep = computed(() => workflowSteps.value.find((step) => step.action === activeTask.value?.action && step.phase === operationPhase.value) || null)
+const nextWorkflowStep = computed(() => {
+  if (!currentWorkflowStep.value) return null
+  const index = workflowSteps.value.findIndex((step) => step.key === currentWorkflowStep.value!.key)
+  return workflowSteps.value[index + 1] || null
+})
+// The Ghana综合岗位建立维修单后，维修技师仍是独立执行岗位。  不把
+// “建单成功”误显示成可以立即做 QA；技师接单并提交结果后，综合岗位
+// 再从步骤条进入 QA。这样既保留了同一账号的连续工作台，也尊重实际
+// 的岗位分离和维修状态机。
+function repairTechHandoffPending() {
+  return activeWorkflow.value === 'ghana'
+    && currentWorkflowStep.value?.key === 'repair-create'
+    && (!hasPermission(user.value, 'repair:receive') || !hasPermission(user.value, 'repair:update'))
+}
 function taskVisible(task: Task) { return Array.isArray(task.permission) ? task.permission.some((code) => hasPermission(user.value, code)) : hasPermission(user.value, task.permission) }
 function scanMode() {
   if (!activeTask.value) return 'imei'
+  if (capturingContainer.value && ['tray', 'box'].includes(activeTask.value.action)) return 'container'
   if (['return', 'repair'].includes(activeTask.value.action) && operationPhase.value !== 'create') return 'imei'
   return activeTask.value.mode
 }
@@ -104,6 +183,7 @@ function phaseRequiresScan() {
 }
 watch(operationPhase, async () => {
   if (!activeTask.value) return
+  syncTaskLocation()
   scanItems.value = []
   stopCamera()
   if (phaseRequiresScan() && !scannerControls) { await nextTick(); await startCamera() }
@@ -132,9 +212,44 @@ function roleNameLabel(id: unknown) {
 function documentTypeLabel(type: unknown) {
   return ({ shipment: '发运单', receiving: '接收验收单', transfer: '门店调拨单', sales: '销售单', return: '销售退回单', repair: '维修单', stocktake: '盘点单' } as Record<string, string>)[String(type)] || String(type)
 }
-const visibleTasks = computed(() => tasks.filter(taskVisible))
+const visibleTasks = computed(() => {
+  const result: Task[] = []
+  const shenzhenMerged = workflowCapabilityReady('shenzhen')
+  const ghanaMerged = workflowCapabilityReady('ghana')
+  if (shenzhenMerged) result.push(workflowTasks[0])
+  if (ghanaMerged) result.push(workflowTasks[1])
+  for (const task of tasks) {
+    // Once a merged岗位 has the complete capability set, its constituent
+    // cards are represented by the single workflow card above.
+    if (shenzhenMerged && ['purchase', 'tray', 'box'].includes(task.action)) continue
+    if (ghanaMerged && ['receiving', 'transfer', 'return', 'repair'].includes(task.action)) continue
+    if (taskVisible(task)) result.push(task)
+  }
+  return result
+})
+const hasWorkflowEntry = computed(() => visibleTasks.value.some((task) => Boolean(task.workflow)))
 const sourceLocations = computed(() => workLocations.value.filter((item) => item.source_allowed))
 const activeLocations = computed(() => workLocations.value)
+const destinationLocations = computed(() => {
+  const action = activeTask.value?.action
+  const current = activeLocations.value.find((item) => String(item.id) === locationId.value)
+  const currentOrganizationId = current ? String(current.organization_id) : ''
+  const sameOrganization = (item: Record<string, unknown>) => !currentOrganizationId || String(item.organization_id) === currentOrganizationId
+  const differentOrganization = (item: Record<string, unknown>) => !currentOrganizationId || String(item.organization_id) !== currentOrganizationId
+  if (action === 'transfer') {
+    const stores = activeLocations.value.filter((item) => item.location_type === 'store' && String(item.id) !== locationId.value && sameOrganization(item))
+    return stores.length ? stores : activeLocations.value
+  }
+  if (action === 'return') {
+    const warehouses = activeLocations.value.filter((item) => ['warehouse', 'receiving'].includes(String(item.location_type)) && String(item.id) !== locationId.value && sameOrganization(item))
+    return warehouses.length ? warehouses : activeLocations.value
+  }
+  if (action === 'shipment') {
+    const warehouses = activeLocations.value.filter((item) => ['warehouse', 'receiving'].includes(String(item.location_type)) && String(item.id) !== locationId.value && differentOrganization(item))
+    return warehouses.length ? warehouses : activeLocations.value
+  }
+  return activeLocations.value
+})
 function scopeAllows(permission: string, locationIdValue: unknown, organizationIdValue: unknown) {
   if (!user.value?.permissions.includes(permission)) return false
   const scopes = user.value.scopes?.[permission] || []
@@ -145,6 +260,38 @@ const sourceLocationsForTask = computed(() => {
   const codes = Array.isArray(activeTask.value.permission) ? activeTask.value.permission : [activeTask.value.permission]
   return workLocations.value.filter((item) => codes.some((code) => scopeAllows(code, item.id, item.organization_id)))
 })
+function syncTaskLocation() {
+  if (!activeTask.value) return
+  if (!phaseRequiresCurrentLocation()) {
+    locationId.value = ''
+    organizationId.value = ''
+    return
+  }
+  const current = workLocations.value.find((item) => String(item.id) === locationId.value)
+  if (current && sourceLocationsForTask.value.some((item) => String(item.id) === locationId.value)) {
+    organizationId.value = String(current.organization_id)
+    return
+  }
+  if (sourceLocationsForTask.value.length === 1) {
+    locationId.value = String(sourceLocationsForTask.value[0].id)
+    syncOrganizationFromLocation()
+  } else {
+    locationId.value = ''
+    organizationId.value = ''
+  }
+}
+function phaseRequiresCurrentLocation() {
+  const action = activeTask.value?.action
+  return Boolean(action && (
+    ['purchase', 'tray', 'box', 'shipment'].includes(action) ||
+    (action === 'receiving' && operationPhase.value === 'start') ||
+    (action === 'transfer' && operationPhase.value === 'issue') ||
+    (action === 'sales' && operationPhase.value === 'create') ||
+    (action === 'return' && operationPhase.value === 'create') ||
+    (action === 'repair' && operationPhase.value === 'create') ||
+    (action === 'stocktake' && operationPhase.value === 'create')
+  ))
+}
 function locationLabel(item: Record<string, unknown>) { return `${item.organization_name} · ${item.name}（${item.code}）` }
 function syncOrganizationFromLocation() {
   const row = workLocations.value.find((item) => String(item.id) === locationId.value)
@@ -248,8 +395,8 @@ async function createAdminRecord(kind: 'organization' | 'location' | 'role' | 'u
       locCode.value = ''; locName.value = ''
     } else if (kind === 'role') {
       if (!roleCode.value.trim() || !roleName.value.trim()) throw new Error('请填写角色代码和名称')
-      await createRole({ code: roleCode.value.trim(), name: roleName.value.trim(), permission_codes: selectedRolePermissions.value })
-      roleCode.value = ''; roleName.value = ''; selectedRolePermissions.value = []
+      await createRole({ code: roleCode.value.trim(), name: roleName.value.trim(), work_group: roleWorkGroup.value.trim() || null, description: roleDescription.value.trim() || null, permission_codes: selectedRolePermissions.value })
+      roleCode.value = ''; roleName.value = ''; roleWorkGroup.value = ''; roleDescription.value = ''; selectedRolePermissions.value = []
     } else {
       const identifier = newUserIdentifier.value.trim()
       if (!identifier || !newUserName.value.trim() || !newUserPassword.value) throw new Error('请填写手机号或英文用户名、姓名和密码')
@@ -292,7 +439,7 @@ async function retryDraft(draft: any) {
       if (draft.phase === 'create') result = await createReturn({ sales_no: draft.document_no, source_organization_id: org, source_location_id: location, destination_organization_id: numeric(draft.destination_organization_id), destination_location_id: numeric(draft.destination_location_id), imeis: draft.container_kind === 'PHONE' ? values : [], containers: draft.container_kind === 'PHONE' ? [] : values.map((code) => ({ kind: draft.container_kind, code })), note: draft.note || null })
       else result = await receiveReturn({ return_no: draft.document_no, received_imeis: values })
     } else if (draft.action === 'repair') {
-      if (draft.phase === 'create') result = await createRepair({ organization_id: org, location_id: location, imeis: draft.container_kind === 'PHONE' ? values : [], containers: draft.container_kind === 'PHONE' ? [] : values.map((code) => ({ kind: draft.container_kind, code })), note: draft.note || null })
+      if (draft.phase === 'create') result = await createRepair({ organization_id: org, location_id: location, imeis: draft.container_kind === 'PHONE' ? values : [], containers: draft.container_kind === 'PHONE' ? [] : values.map((code) => ({ kind: draft.container_kind, code })), return_no: draft.workflow === 'ghana' ? (draft.document_no || null) : null, note: draft.note || null })
       else if (draft.phase === 'accept') result = await acceptRepair(draft.document_no)
       else if (draft.phase === 'complete') { for (const imei of values) { setOperationKey(`${draft.idempotency_key || draft.id}:${imei}`); result = await completeRepair(draft.document_no, { imei, repair_result: draft.repair_result }) } }
       else { for (const imei of values) { setOperationKey(`${draft.idempotency_key || draft.id}:${imei}`); result = await reviewRepair(draft.document_no, { imei, disposition: draft.disposition }) } }
@@ -309,7 +456,10 @@ async function retryAllDrafts() { for (const draft of drafts.value.filter((item)
 function setOnline() { online.value = navigator.onLine }
 async function submitLogin() {
   error.value = ''
-  if (!phone.value.trim()) return void (error.value = '请输入手机号')
+  // A browser may retain a key from an interrupted operation.  Login is a
+  // new session boundary and must never inherit that business-operation key.
+  endOperation()
+  if (!phone.value.trim()) return void (error.value = '请输入手机号或用户名')
   if (loginMode.value === 'password' && !password.value) return void (error.value = '请输入密码')
   if (loginMode.value === 'sms' && !code.value) return void (error.value = '请输入验证码')
   loading.value = true
@@ -328,7 +478,21 @@ async function requestCode() {
   try { await sendSmsCode(phone.value.trim()); smsSent.value = true }
   catch (err) { error.value = err instanceof Error ? err.message : '验证码发送失败' }
 }
-function logout() { showProfileMenu.value = false; localStorage.removeItem('gh-phone-access-token'); user.value = null }
+function logout() {
+  showProfileMenu.value = false
+  endOperation()
+  stopCamera()
+  localStorage.removeItem('gh-phone-access-token')
+  user.value = null
+  activeTask.value = null
+  activeWorkflow.value = null
+  scanItems.value = []
+  operationMessage.value = ''
+  error.value = ''
+  workflowDocuments.value = {}
+  organizationId.value = ''; locationId.value = ''
+  destinationOrganizationId.value = ''; destinationLocationId.value = ''
+}
 function openProfileEditor() {
   if (!user.value) return
   profileDisplayName.value = user.value.display_name
@@ -349,18 +513,87 @@ async function saveProfile() {
   } catch (err) { error.value = err instanceof Error ? err.message : '保存个人资料失败' }
   finally { profileSaving.value = false }
 }
-async function openTask(task: Task) {
+async function activateTask(task: Task, forcedPhase?: string, preserveLocation = false) {
+  if (activeWorkflow.value && activeTask.value?.action && documentNo.value.trim()) {
+    workflowDocuments.value[`${activeWorkflow.value}:${activeTask.value.action}`] = documentNo.value.trim()
+  }
   beginOperation()
-  activeTask.value = task; scanItems.value = []; manualValue.value = ''; cameraError.value = ''; operationMessage.value = ''; organizationId.value = ''; locationId.value = ''; containerCode.value = ''; targetTrayCode.value = ''; targetBoxCode.value = ''; containerKind.value = task.action === 'box' ? 'TRAY' : 'BOX'; documentNo.value = ''; destinationOrganizationId.value = ''; destinationLocationId.value = ''; logisticsNo.value = ''; accepted.value = true; customerName.value = ''; salePrices.value = ''; disposition.value = 'AVAILABLE_AGAIN'; repairResult.value = 'REPAIRED'; adjustmentDecision.value = 'IGNORE'; adjustmentTargetStatus.value = '可再次销售'; operationPhase.value = initialPhase(task.action)
+  const previousLocation = preserveLocation ? locationId.value : ''
+  const previousOrganization = preserveLocation ? organizationId.value : ''
+  activeTask.value = task
+  scanItems.value = []
+  manualValue.value = ''
+  cameraError.value = ''
+  operationMessage.value = ''
+  if (!preserveLocation) { organizationId.value = ''; locationId.value = '' }
+  containerCode.value = ''
+  capturingContainer.value = ['tray', 'box'].includes(task.action)
+  targetTrayCode.value = ''
+  targetBoxCode.value = ''
+  containerKind.value = task.action === 'box' ? 'TRAY' : 'BOX'
+  const workflowDocumentKey = activeWorkflow.value ? `${activeWorkflow.value}:${task.action}` : ''
+  documentNo.value = workflowDocumentKey ? (workflowDocuments.value[workflowDocumentKey] || '') : ''
+  destinationOrganizationId.value = ''
+  destinationLocationId.value = ''
+  logisticsNo.value = ''
+  accepted.value = true
+  customerName.value = ''
+  salePrices.value = ''
+  disposition.value = 'AVAILABLE_AGAIN'
+  repairResult.value = 'REPAIRED'
+  adjustmentDecision.value = 'IGNORE'
+  adjustmentTargetStatus.value = '可再次销售'
+  operationPhase.value = forcedPhase ?? initialPhase(task.action)
+  // Ghana return intake is received at the management office and then
+  // physically handed to the repair area.  Default this hand-off to loose
+  // IMEI scanning; the source return tray/box is opened before scanning.
+  if (task.action === 'repair' && operationPhase.value === 'create') {
+    containerKind.value = 'PHONE'
+    if (activeWorkflow.value === 'ghana' && !documentNo.value.trim()) {
+      documentNo.value = workflowDocuments.value['ghana:return'] || ''
+    }
+  }
   await nextTick()
-  if (sourceLocationsForTask.value.length === 1) {
-    locationId.value = String(sourceLocationsForTask.value[0].id)
-    syncOrganizationFromLocation()
+  if (phaseRequiresCurrentLocation()) {
+    const canKeepLocation = preserveLocation && previousLocation && sourceLocationsForTask.value.some((item) => String(item.id) === previousLocation)
+    if (canKeepLocation) {
+      locationId.value = previousLocation
+      organizationId.value = previousOrganization
+    } else if (sourceLocationsForTask.value.length === 1) {
+      locationId.value = String(sourceLocationsForTask.value[0].id)
+      syncOrganizationFromLocation()
+    } else {
+      locationId.value = ''
+      organizationId.value = ''
+    }
+  } else {
+    locationId.value = ''
+    organizationId.value = ''
   }
   if (phaseRequiresScan() && !scannerControls) await startCamera()
 }
+async function openTask(task: Task) {
+  if (task.workflow) {
+    activeWorkflow.value = task.workflow
+    const first = workflowSteps.value[0]
+    if (first) await activateTask(underlyingTask(first.action)!, first.phase)
+    else activeWorkflow.value = null
+    return
+  }
+  activeWorkflow.value = null
+  await activateTask(task)
+}
+async function selectWorkflowStep(step: WorkflowStep) {
+  if (!activeWorkflow.value || !hasPermission(user.value, step.permission)) return
+  const task = underlyingTask(step.action)
+  if (!task) return
+  await activateTask(task, step.phase, true)
+}
+async function advanceWorkflow() {
+  if (nextWorkflowStep.value) await selectWorkflowStep(nextWorkflowStep.value)
+}
 function closeTask() {
-  try { stopCamera() } finally { activeTask.value = null; cameraError.value = ''; operationMessage.value = '' }
+  try { stopCamera() } finally { activeTask.value = null; activeWorkflow.value = null; cameraError.value = ''; operationMessage.value = '' }
 }
 async function startCamera() {
   if (!window.isSecureContext) return void (cameraError.value = '当前页面不是 HTTPS 安全连接，iPhone 无法使用摄像头；请打开 HTTPS 地址或手工输入')
@@ -437,6 +670,15 @@ function normalizeScanValue(value: string) {
 function addScan(value: string) {
   const clean = normalizeScanValue(value)
   if (!clean || scanItems.value.some((item) => item.value === clean)) return
+  if (capturingContainer.value && activeTask.value && ['tray', 'box'].includes(activeTask.value.action)) {
+    containerCode.value = clean
+    capturingContainer.value = false
+    cameraError.value = `已读取目标${activeTask.value.action === 'tray' ? '托盘' : '箱子'}：${clean}，请继续扫描${activeTask.value.action === 'tray' ? '手机 IMEI' : '托盘编码'}`
+    navigator.vibrate?.(35)
+    stopCamera()
+    nextTick(() => { if (phaseRequiresScan()) startCamera() })
+    return
+  }
   if (scanMode() === 'imei' && !isValidImei(clean)) {
     cameraError.value = '未识别到有效 IMEI（应为 15 位数字），请将条码完整对准取景框或手工输入'
     navigator.vibrate?.([35, 45, 35])
@@ -447,6 +689,21 @@ function addScan(value: string) {
   navigator.vibrate?.(35)
 }
 function addManual() { addScan(manualValue.value); manualValue.value = '' }
+function containerCodeChanged() {
+  if (containerCode.value.trim() && activeTask.value && ['tray', 'box'].includes(activeTask.value.action)) {
+    capturingContainer.value = false
+    cameraError.value = `目标${activeTask.value.action === 'tray' ? '托盘' : '箱子'}已填写，请继续扫描${activeTask.value.action === 'tray' ? '手机 IMEI' : '托盘编码'}`
+    stopCamera()
+  }
+}
+function recaptureContainer() {
+  if (!activeTask.value || !['tray', 'box'].includes(activeTask.value.action)) return
+  containerCode.value = ''
+  capturingContainer.value = true
+  scanItems.value = []
+  cameraError.value = `请先扫描目标${activeTask.value.action === 'tray' ? '托盘' : '箱子'}编码`
+  nextTick(() => { if (!scannerControls) startCamera() })
+}
 function removeScan(value: string) { scanItems.value = scanItems.value.filter((item) => item.value !== value) }
 function numeric(value: string) { const parsed = Number(value); return Number.isInteger(parsed) && parsed > 0 ? parsed : null }
 function containers() { return scanItems.value.map((item) => ({ kind: containerKind.value, code: item.value })) }
@@ -488,6 +745,8 @@ async function submitScans() {
       if (operationPhase.value === 'start') {
         requireCurrentIds()
         const result = await startReceiving({ shipment_no: documentNo.value.trim(), organization_id: org, location_id: location })
+        workflowDocuments.value[`ghana:receiving`] = result.receiving_no
+        documentNo.value = result.receiving_no
         operationMessage.value = `接收单 ${result.receiving_no} 已建立 · 待验收 ${result.expected_count} 台`
       } else {
         let result: any = null
@@ -525,14 +784,14 @@ async function submitScans() {
         operationMessage.value = `退回单 ${result.return_no} 已创建 · ${result.total_count} 台`
       } else {
         if (!documentNo.value.trim()) throw new Error('请填写退回单号')
-        const result = await receiveReturn({ return_no: documentNo.value.trim(), received_imeis: scanItems.value.map((item) => item.value) }); operationMessage.value = `退回已接收 · ${result.received_count} / ${result.total_count} 台`
+        const result = await receiveReturn({ return_no: documentNo.value.trim(), received_imeis: scanItems.value.map((item) => item.value) }); workflowDocuments.value[`ghana:return`] = documentNo.value.trim(); operationMessage.value = `退回已接收 · ${result.received_count} / ${result.total_count} 台`
       }
     } else if (task.action === 'repair') {
       if (operationPhase.value === 'create') {
         requireCurrentIds()
         const values = scanItems.value.map((item) => item.value)
         const asPhones = containerKind.value === 'PHONE'
-        const result = await createRepair({ organization_id: org, location_id: location, imeis: asPhones ? values : [], containers: asPhones ? [] : containers(), note: null }); operationMessage.value = `维修单 ${result.repair_no} 已建立`
+        const result = await createRepair({ organization_id: org, location_id: location, imeis: asPhones ? values : [], containers: asPhones ? [] : containers(), return_no: documentNo.value.trim() || null, note: null }); operationMessage.value = `维修单 ${result.repair_no} 已建立`
       } else if (operationPhase.value === 'accept') {
         if (!documentNo.value.trim()) throw new Error('请填写维修单号'); const result = await acceptRepair(documentNo.value.trim()); operationMessage.value = `维修单 ${result.repair_no} 已接收`
       } else if (operationPhase.value === 'complete') {
@@ -556,7 +815,7 @@ async function submitScans() {
   } catch (err) {
     if (!online.value || err instanceof TypeError) {
       const id = crypto.randomUUID?.() || `${Date.now()}-${Math.random()}`
-      drafts.value.push({ id, idempotency_key: localStorage.getItem('gh-phone-operation-key') || id, action: task.action, phase: operationPhase.value, values: scanItems.value.map((item) => item.value), organization_id: organizationId.value, location_id: locationId.value, destination_organization_id: destinationOrganizationId.value, destination_location_id: destinationLocationId.value, container_code: containerCode.value, target_tray_code: targetTrayCode.value, target_box_code: targetBoxCode.value, container_kind: containerKind.value, logistics_no: logisticsNo.value, document_no: documentNo.value, accepted: accepted.value, sales_type: salesType.value, customer_name: customerName.value, prices: salePrices.value ? Object.fromEntries(scanItems.value.map((item, index) => [item.value, salePrices.value.split(',')[index]?.trim() || salePrices.value.trim()])) : {}, repair_result: repairResult.value, disposition: disposition.value, adjustment_decision: adjustmentDecision.value, adjustment_target_status: adjustmentTargetStatus.value, created_at: new Date().toISOString(), status: 'pending' }); saveDrafts()
+      drafts.value.push({ id, idempotency_key: localStorage.getItem('gh-phone-operation-key') || id, action: task.action, phase: operationPhase.value, workflow: activeWorkflow.value, values: scanItems.value.map((item) => item.value), organization_id: organizationId.value, location_id: locationId.value, destination_organization_id: destinationOrganizationId.value, destination_location_id: destinationLocationId.value, container_code: containerCode.value, target_tray_code: targetTrayCode.value, target_box_code: targetBoxCode.value, container_kind: containerKind.value, logistics_no: logisticsNo.value, document_no: documentNo.value, accepted: accepted.value, sales_type: salesType.value, customer_name: customerName.value, prices: salePrices.value ? Object.fromEntries(scanItems.value.map((item, index) => [item.value, salePrices.value.split(',')[index]?.trim() || salePrices.value.trim()])) : {}, repair_result: repairResult.value, disposition: disposition.value, adjustment_decision: adjustmentDecision.value, adjustment_target_status: adjustmentTargetStatus.value, created_at: new Date().toISOString(), status: 'pending' }); saveDrafts()
       operationMessage.value = '网络不可用，已保存为待同步草稿；联网后请在单据中心复核提交'
       scanItems.value = scanItems.value.map((item) => ({ ...item, result: '待提交' })); error.value = ''
     } else error.value = err instanceof Error ? err.message : '提交失败'
@@ -600,13 +859,15 @@ onUnmounted(() => { stopCamera(); window.removeEventListener('online', setOnline
   </main>
 
   <main v-else class="shell">
-    <header class="topbar"><div><p class="eyebrow">GHANA PHONE MANAGEMENT</p><h1>今天要处理什么？</h1></div><div class="profile-wrap"><button class="profile" aria-label="打开用户菜单" :aria-expanded="showProfileMenu" @click.stop="showProfileMenu = !showProfileMenu">{{ user.display_name.slice(0, 1) }}</button><div v-if="showProfileMenu" class="profile-menu"><div class="profile-menu-card"><span class="muted">当前账号</span><strong>{{ user.display_name }}</strong><small>{{ user.username || user.phone }}</small><span :class="['online', { offline: !online }]"><i />{{ online ? '在线' : '离线' }}</span></div><button @click="openProfileEditor">个人资料与修改密码</button><button class="logout-menu" @click="logout">退出登录</button></div></div></header>
+    <header class="topbar"><div><p class="eyebrow">GHANA PHONE MANAGEMENT</p><h1>今天要处理什么？</h1><small v-if="roleLabel" class="role-chip">当前岗位：{{ roleLabel }}</small></div><div class="profile-wrap"><button class="profile" aria-label="打开用户菜单" :aria-expanded="showProfileMenu" @click.stop="showProfileMenu = !showProfileMenu">{{ user.display_name.slice(0, 1) }}</button><div v-if="showProfileMenu" class="profile-menu"><div class="profile-menu-card"><span class="muted">当前账号</span><strong>{{ user.display_name }}</strong><small>{{ user.username || user.phone }}</small><small v-if="roleLabel">岗位：{{ roleLabel }}</small><span :class="['online', { offline: !online }]"><i />{{ online ? '在线' : '离线' }}</span></div><button @click="openProfileEditor">个人资料与修改密码</button><button class="logout-menu" @click="logout">退出登录</button></div></div></header>
     <button v-if="pendingCount" class="pending-note pending-button" @click="showDrafts = true">{{ pendingCount }} 条待同步草稿 · 打开单据中心</button>
     <button v-if="installPrompt" class="install-banner" @click="installPwa">＋ 添加到手机桌面</button>
+    <p v-if="currentView === 'work' && hasWorkflowEntry" class="workflow-home-note">当前岗位已合并为连续作业入口：进入一张卡片后按现场顺序完成每个步骤，系统仍会为每一步保留独立单据和审计记录。</p>
     <section v-if="currentView === 'work'" class="action-grid"><button v-for="task in visibleTasks" :key="task.title" class="action-card" @click="openTask(task)"><span class="action-main"><component :is="task.icon" class="action-icon" :size="22" :stroke-width="1.8" /><span class="action-title">{{ task.title }}</span></span><span class="muted action-hint">{{ task.hint }}</span></button></section>
     <section v-if="currentView === 'inventory'" class="data-section"><div class="section-title"><h2>当前库存</h2><button class="text-button" @click="switchView('inventory')">刷新</button></div><p v-if="viewLoading" class="empty-note">加载中…</p><div v-for="item in inventoryItems" :key="String(item.imei)" class="data-row"><div><strong>{{ item.imei }}</strong><small>{{ item.brand || '' }} {{ item.model || '' }}</small></div><span class="status-text">{{ item.status }}</span></div><p v-if="!viewLoading && !inventoryItems.length" class="empty-note">暂无可见库存</p></section>
     <section v-if="currentView === 'documents'" class="data-section"><div class="section-title"><h2>业务单据</h2><button class="text-button" @click="switchView('documents')">刷新</button></div><p v-if="viewLoading" class="empty-note">加载中…</p><div v-for="item in documentItems" :key="`${item.type}-${item.no}`" class="data-row"><div><strong>{{ item.no }}</strong><small>{{ documentTypeLabel(item.type) }} · {{ item.total_count }} 台</small></div><span class="status-text">{{ item.status }}</span></div><p v-if="!viewLoading && !documentItems.length" class="empty-note">暂无可见单据</p></section>
-    <section v-if="currentView === 'admin'" class="data-section"><div class="section-title"><h2>权限与组织</h2><button class="text-button" @click="switchView('admin')">刷新</button></div><p v-if="viewLoading" class="empty-note">加载中…</p><div class="admin-summary"><strong>{{ adminData.users.length }} 个用户</strong><strong>{{ adminData.roles.length }} 个角色</strong><strong>{{ adminData.organizations.length }} 个组织</strong><strong>{{ adminData.locations.length }} 个地点</strong></div><div class="admin-tabs"><button v-if="hasPermission(user, 'user:manage')" :class="{ active: adminTab === 'users' }" @click="adminTab = 'users'">用户</button><button v-if="hasPermission(user, 'user:manage')" :class="{ active: adminTab === 'organizations' }" @click="adminTab = 'organizations'">组织</button><button v-if="hasPermission(user, 'user:manage')" :class="{ active: adminTab === 'locations' }" @click="adminTab = 'locations'">地点</button><button v-if="hasPermission(user, 'role:manage')" :class="{ active: adminTab === 'roles' }" @click="adminTab = 'roles'">角色</button></div><div v-if="adminTab === 'users' && hasPermission(user, 'user:manage')" class="admin-panel"><div class="admin-form"><input v-model="newUserPhone" inputmode="tel" placeholder="新用户手机号" /><input v-model="newUserName" placeholder="姓名" /><input v-model="newUserPassword" type="password" placeholder="初始密码" /><select v-model="newUserRoleIds" multiple><option v-for="role in adminData.roles" :key="String(role.id)" :value="Number(role.id)">{{ roleNameLabel(role.id) }}</option></select><textarea v-model="newUserScopes" placeholder='数据范围 JSON，例如 [{"permission_code":"phone:view","scope_kind":"location","scope_value":"20"}]'></textarea><button class="secondary" @click="createAdminRecord('user')">创建用户</button></div><p class="hint">系统遵循“无范围即拒绝”；角色只赋予功能权限，地点/组织范围仍需单独配置。</p><div v-for="item in adminData.users" :key="String(item.id)" class="data-row"><div><strong>{{ item.display_name }}</strong><small>{{ item.phone }} · 角色 {{ roleIdsLabel(item) }}</small></div><div class="row-actions"><span class="status-text">{{ item.is_active ? '启用' : '停用' }}</span><button class="text-button" @click="beginEditUser(item)">权限</button><button class="text-button" @click="toggleUser(item)">{{ item.is_active ? '停用' : '启用' }}</button></div></div><div v-if="editingUserId !== null" class="admin-edit"><strong>编辑用户权限 #{{ editingUserId }}</strong><select v-model="editingUserRoleIds" multiple><option v-for="role in adminData.roles" :key="String(role.id)" :value="Number(role.id)">{{ roleNameLabel(role.id) }}</option></select><textarea v-model="editingUserScopes" placeholder="数据范围 JSON 数组"></textarea><div class="row-actions"><button class="secondary" @click="saveUserEdit">保存权限</button><button class="text-button" @click="cancelEditUser">取消</button></div></div></div><div v-if="adminTab === 'organizations' && hasPermission(user, 'user:manage')" class="admin-panel"><div class="admin-form"><input v-model="orgCode" placeholder="组织代码" /><input v-model="orgName" placeholder="组织名称" /><input v-model="orgCountry" placeholder="国家代码" /><button class="secondary" @click="createAdminRecord('organization')">创建组织</button></div><div v-for="item in adminData.organizations" :key="String(item.id)" class="data-row"><div><strong>{{ item.name }}</strong><small>{{ item.id }} · {{ item.code }} · {{ item.country }}</small></div><span class="status-text">{{ item.is_active ? '启用' : '停用' }}</span></div></div><div v-if="adminTab === 'locations' && hasPermission(user, 'user:manage')" class="admin-panel"><div class="admin-form"><input v-model="locOrganizationId" inputmode="numeric" placeholder="所属组织 ID" /><input v-model="locCode" placeholder="地点代码" /><input v-model="locName" placeholder="地点名称" /><select v-model="locType"><option value="store">门店</option><option value="warehouse">仓库</option><option value="repair">维修区</option><option value="receiving">接收区</option></select><button class="secondary" @click="createAdminRecord('location')">创建地点</button></div><div v-for="item in adminData.locations" :key="String(item.id)" class="data-row"><div><strong>{{ item.name }}</strong><small>{{ item.id }} · 组织 {{ item.organization_id }} · {{ item.code }}</small></div><span class="status-text">{{ item.location_type }}</span></div></div><div v-if="adminTab === 'roles' && hasPermission(user, 'role:manage')" class="admin-panel"><div class="admin-form"><input v-model="roleCode" placeholder="角色代码" /><input v-model="roleName" placeholder="角色名称" /><div class="permission-grid"><label v-for="permission in adminData.permissions" :key="String(permission.code)"><input v-model="selectedRolePermissions" type="checkbox" :value="String(permission.code)" />{{ permissionLabel(permission.code) }}</label></div><button class="secondary" @click="createAdminRecord('role')">创建角色</button></div></div></section>
+    <section v-if="currentView === 'admin'" class="data-section"><div class="section-title"><h2>权限与组织</h2><button class="text-button" @click="switchView('admin')">刷新</button></div><p v-if="viewLoading" class="empty-note">加载中…</p><div class="admin-summary"><strong>{{ adminData.users.length }} 个用户</strong><strong>{{ adminData.roles.length }} 个角色</strong><strong>{{ adminData.organizations.length }} 个组织</strong><strong>{{ adminData.locations.length }} 个地点</strong></div><div class="admin-tabs"><button v-if="hasPermission(user, 'user:manage')" :class="{ active: adminTab === 'users' }" @click="adminTab = 'users'">用户</button><button v-if="hasPermission(user, 'user:manage')" :class="{ active: adminTab === 'organizations' }" @click="adminTab = 'organizations'">组织</button><button v-if="hasPermission(user, 'user:manage')" :class="{ active: adminTab === 'locations' }" @click="adminTab = 'locations'">地点</button><button v-if="hasPermission(user, 'role:manage')" :class="{ active: adminTab === 'roles' }" @click="adminTab = 'roles'">角色</button></div><div v-if="adminTab === 'users' && hasPermission(user, 'user:manage')" class="admin-panel"><div class="admin-form"><input v-model="newUserPhone" inputmode="tel" placeholder="手机号或英文用户名" /><input v-model="newUserName" placeholder="姓名" /><input v-model="newUserPassword" type="password" placeholder="初始密码" /><select v-model="newUserRoleIds" multiple><option v-for="role in adminData.roles" :key="String(role.id)" :value="Number(role.id)">{{ roleNameLabel(role.id) }}</option></select><textarea v-model="newUserScopes" placeholder='数据范围 JSON，例如 [{"permission_code":"phone:view","scope_kind":"location","scope_value":"20"}]'></textarea><button class="secondary" @click="createAdminRecord('user')">创建用户</button></div><p class="hint">系统遵循“无范围即拒绝”；角色只赋予功能权限，地点/组织范围仍需单独配置。</p><div v-for="item in adminData.users" :key="String(item.id)" class="data-row"><div><strong>{{ item.display_name }}</strong><small>{{ item.phone }} · 角色 {{ roleIdsLabel(item) }}</small></div><div class="row-actions"><span class="status-text">{{ item.is_active ? '启用' : '停用' }}</span><button class="text-button" @click="beginEditUser(item)">权限</button><button class="text-button" @click="toggleUser(item)">{{ item.is_active ? '停用' : '启用' }}</button></div></div><div v-if="editingUserId !== null" class="admin-edit"><strong>编辑用户权限 #{{ editingUserId }}</strong><select v-model="editingUserRoleIds" multiple><option v-for="role in adminData.roles" :key="String(role.id)" :value="Number(role.id)">{{ roleNameLabel(role.id) }}</option></select><textarea v-model="editingUserScopes" placeholder="数据范围 JSON 数组"></textarea><div class="row-actions"><button class="secondary" @click="saveUserEdit">保存权限</button><button class="text-button" @click="cancelEditUser">取消</button></div></div></div><div v-if="adminTab === 'organizations' && hasPermission(user, 'user:manage')" class="admin-panel"><div class="admin-form"><input v-model="orgCode" placeholder="组织代码" /><input v-model="orgName" placeholder="组织名称" /><input v-model="orgCountry" placeholder="国家代码" /><button class="secondary" @click="createAdminRecord('organization')">创建组织</button></div><div v-for="item in adminData.organizations" :key="String(item.id)" class="data-row"><div><strong>{{ item.name }}</strong><small>{{ item.id }} · {{ item.code }} · {{ item.country }}</small></div><span class="status-text">{{ item.is_active ? '启用' : '停用' }}</span></div></div><div v-if="adminTab === 'locations' && hasPermission(user, 'user:manage')" class="admin-panel"><div class="admin-form"><input v-model="locOrganizationId" inputmode="numeric" placeholder="所属组织 ID" /><input v-model="locCode" placeholder="地点代码" /><input v-model="locName" placeholder="地点名称" /><select v-model="locType"><option value="store">门店</option><option value="warehouse">仓库</option><option value="repair">维修区</option><option value="receiving">接收区</option></select><button class="secondary" @click="createAdminRecord('location')">创建地点</button></div><div v-for="item in adminData.locations" :key="String(item.id)" class="data-row"><div><strong>{{ item.name }}</strong><small>{{ item.id }} · 组织 {{ item.organization_id }} · {{ item.code }}</small></div><span class="status-text">{{ item.location_type }}</span></div></div><div v-if="adminTab === 'roles' && hasPermission(user, 'role:manage')" class="admin-panel"><div class="admin-form"><input v-model="roleCode" placeholder="角色代码" /><input v-model="roleName" placeholder="角色名称" /><input v-model="roleWorkGroup" placeholder="工作组（如 GHANA_OPERATIONS）" /><input v-model="roleDescription" placeholder="岗位职责说明（可选）" /><div class="permission-grid"><label v-for="permission in adminData.permissions" :key="String(permission.code)"><input v-model="selectedRolePermissions" type="checkbox" :value="String(permission.code)" />{{ permissionLabel(permission.code) }}</label></div><button class="secondary" @click="createAdminRecord('role')">创建角色</button></div></div></section>
+    <section v-if="currentView === 'admin' && adminTab === 'roles' && hasPermission(user, 'role:manage')" class="admin-actions"><p class="hint">当前列表只显示启用角色；历史拆分角色保留在数据库中但不可重新分配。</p><div v-for="item in adminData.roles" :key="`role-action-${item.id}`" class="data-row"><div><strong>{{ item.name }}</strong><small>{{ item.code }} · {{ item.work_group || '未分组' }} · {{ Array.isArray(item.permission_codes) ? item.permission_codes.length : 0 }} 项权限</small><small v-if="item.description">{{ item.description }}</small></div><span class="status-text">{{ item.is_active ? '启用' : '停用' }}</span></div></section>
     <section v-if="currentView === 'admin' && adminTab === 'organizations' && hasPermission(user, 'user:manage')" class="admin-actions"><p class="hint">停用不会删除历史单据，只会阻止后续业务使用该组织。</p><div v-for="item in adminData.organizations" :key="`org-action-${item.id}`" class="data-row"><strong>{{ item.name }}</strong><button class="text-button" @click="toggleAdminResource('organization', item)">{{ item.is_active ? '停用' : '启用' }}</button></div></section>
     <section v-if="currentView === 'admin' && adminTab === 'locations' && hasPermission(user, 'user:manage')" class="admin-actions"><p class="hint">停用不会删除历史单据，只会阻止后续业务使用该地点。</p><div v-for="item in adminData.locations" :key="`location-action-${item.id}`" class="data-row"><strong>{{ item.name }}</strong><button class="text-button" @click="toggleAdminResource('location', item)">{{ item.is_active ? '停用' : '启用' }}</button></div></section>
     <button v-if="currentView === 'admin' && hasPermission(user, 'audit:view')" class="secondary audit-switch" @click="adminTab = 'audits'">查看操作审计</button>
@@ -623,30 +884,44 @@ onUnmounted(() => { stopCamera(); window.removeEventListener('online', setOnline
       <p v-if="!drafts.length" class="empty-note">暂无草稿</p>
     </section></div>
     <div v-if="activeTask" class="modal-backdrop" @click.self="closeTask"><section class="scan-modal">
-      <header class="modal-header"><div><p class="eyebrow">{{ activeTask.title }}</p><h2>{{ activeTask.action === 'query' ? '查询 IMEI' : '连续扫描' }}</h2></div><button class="close" @click="closeTask">×</button></header>
+      <header class="modal-header"><div><p class="eyebrow">{{ activeWorkflow ? (activeWorkflow === 'shenzhen' ? '深圳收购仓作业' : '加纳综合仓作业') : activeTask.title }}</p><h2>{{ activeTask.action === 'query' ? '查询 IMEI' : (currentWorkflowStep?.label || '连续扫描') }}</h2></div><button class="close" @click="closeTask">×</button></header>
+      <section v-if="activeWorkflow" class="workflow-strip" aria-label="岗位作业步骤">
+        <p class="workflow-guide">同一岗位按现场顺序完成，已完成后可切换下一步；每一步仍保留独立的提交记录。</p>
+        <div class="workflow-steps">
+          <button v-for="(step, index) in workflowSteps" :key="step.key" :class="['workflow-step', { active: currentWorkflowStep?.key === step.key }]" @click="selectWorkflowStep(step)">
+            <span>{{ index + 1 }}</span><strong>{{ step.label }}</strong><small>{{ step.hint }}</small>
+          </button>
+        </div>
+        <p v-if="repairTechHandoffPending() && operationMessage" class="workflow-wait">维修单已建立，等待维修技师接单并提交结果；完成后再进入“维修 QA”。</p>
+        <button v-if="nextWorkflowStep && operationMessage && !repairTechHandoffPending()" class="workflow-next" @click="advanceWorkflow">下一步：{{ nextWorkflowStep.label }} →</button>
+      </section>
       <div v-if="phaseRequiresScan()" class="camera-box"><video ref="video" muted playsinline /><span v-if="scanning" class="scan-line" /><p class="camera-message">{{ cameraError || '将条码放入框内' }}</p></div>
       <div v-if="activeTask.action !== 'query'" class="task-fields">
-        <select v-model="locationId" @change="syncOrganizationFromLocation"><option value="">选择当前地点</option><option v-for="item in sourceLocationsForTask" :key="String(item.id)" :value="String(item.id)">{{ locationLabel(item) }}</option></select>
-        <input v-model="organizationId" inputmode="numeric" placeholder="当前组织编号（自动）" readonly />
-        <input v-if="['tray', 'box'].includes(activeTask.action)" v-model="containerCode" placeholder="目标容器编号" />
+        <template v-if="phaseRequiresCurrentLocation()"><select v-model="locationId" @change="syncOrganizationFromLocation"><option value="">选择当前地点</option><option v-for="item in sourceLocationsForTask" :key="String(item.id)" :value="String(item.id)">{{ locationLabel(item) }}</option></select>
+        <input v-model="organizationId" inputmode="numeric" placeholder="当前组织编号（自动）" readonly /></template>
+        <div v-if="['tray', 'box'].includes(activeTask.action)" class="container-capture">
+          <input v-model="containerCode" :placeholder="capturingContainer ? `请先扫描目标${activeTask.action === 'tray' ? '托盘' : '箱子'}编码` : `目标${activeTask.action === 'tray' ? '托盘' : '箱子'}编号`" @change="containerCodeChanged" @keyup.enter="containerCodeChanged" />
+          <button class="text-button" type="button" @click="recaptureContainer">重扫</button>
+        </div>
         <template v-if="['shipment', 'transfer', 'sales'].includes(activeTask.action)">
           <select v-model="containerKind"><option value="PHONE">手机 IMEI</option><option value="TRAY">托盘编号</option><option value="BOX">箱子编号</option></select>
         </template>
         <template v-if="['return', 'repair'].includes(activeTask.action) && operationPhase === 'create'">
           <select v-model="containerKind"><option value="PHONE">手机 IMEI</option><option value="TRAY">托盘编号</option><option value="BOX">箱子编号</option></select>
         </template>
-        <template v-if="['shipment', 'transfer', 'return'].includes(activeTask.action)">
-          <select v-model="destinationLocationId" @change="syncDestinationOrganization"><option value="">选择目标地点</option><option v-for="item in activeLocations" :key="`destination-${item.id}`" :value="String(item.id)">{{ locationLabel(item) }}</option></select>
+        <template v-if="activeTask.action === 'shipment' || (activeTask.action === 'transfer' && operationPhase === 'issue') || (activeTask.action === 'return' && operationPhase === 'create')">
+          <select v-model="destinationLocationId" @change="syncDestinationOrganization"><option value="">选择目标地点</option><option v-for="item in destinationLocations" :key="`destination-${item.id}`" :value="String(item.id)">{{ locationLabel(item) }}</option></select>
           <input v-model="destinationOrganizationId" inputmode="numeric" placeholder="目标组织编号（自动）" readonly />
         </template>
-        <select v-if="activeTask.action === 'receiving'" v-model="operationPhase"><option v-if="hasPermission(user, 'receiving:unpack')" value="start">建立接收单</option><option v-if="hasPermission(user, 'receiving:accept')" value="inspect">逐台验收</option></select>
-        <select v-if="activeTask.action === 'transfer'" v-model="operationPhase"><option v-if="hasPermission(user, 'transfer:create')" value="issue">发起出库/串货</option><option v-if="hasPermission(user, 'transfer:receive')" value="receive">门店收货</option></select>
-        <select v-if="activeTask.action === 'sales'" v-model="operationPhase"><option v-if="hasPermission(user, 'sales:create')" value="create">制销售单</option><option v-if="hasPermission(user, 'sales:approve')" value="confirm">主管确认</option></select>
-        <select v-if="activeTask.action === 'return'" v-model="operationPhase"><option v-if="hasPermission(user, 'return:create')" value="create">发起退回</option><option v-if="hasPermission(user, 'return:receive')" value="receive">管理处接收</option></select>
-        <select v-if="activeTask.action === 'repair'" v-model="operationPhase"><option v-if="hasPermission(user, 'repair:create')" value="create">建立送修单</option><option v-if="hasPermission(user, 'repair:receive')" value="accept">维修人员接收</option><option v-if="hasPermission(user, 'repair:update')" value="complete">填写维修结果</option><option v-if="hasPermission(user, 'repair:approve')" value="review">管理处复核</option></select>
-        <select v-if="activeTask.action === 'stocktake'" v-model="operationPhase"><option v-if="hasPermission(user, 'stocktake:submit')" value="create">提交现场盘点</option><option v-if="hasPermission(user, 'stocktake:adjust')" value="adjust">审核盘点差异</option></select>
+        <select v-if="!activeWorkflow && activeTask.action === 'receiving'" v-model="operationPhase"><option v-if="hasPermission(user, 'receiving:unpack')" value="start">建立接收单</option><option v-if="hasPermission(user, 'receiving:accept')" value="inspect">逐台验收</option></select>
+        <select v-if="!activeWorkflow && activeTask.action === 'transfer'" v-model="operationPhase"><option v-if="hasPermission(user, 'transfer:create')" value="issue">发起出库/串货</option><option v-if="hasPermission(user, 'transfer:receive')" value="receive">门店收货</option></select>
+        <select v-if="!activeWorkflow && activeTask.action === 'sales'" v-model="operationPhase"><option v-if="hasPermission(user, 'sales:create')" value="create">制销售单</option><option v-if="hasPermission(user, 'sales:approve')" value="confirm">主管确认</option></select>
+        <select v-if="!activeWorkflow && activeTask.action === 'return'" v-model="operationPhase"><option v-if="hasPermission(user, 'return:create')" value="create">发起退回</option><option v-if="hasPermission(user, 'return:receive')" value="receive">管理处接收</option></select>
+        <select v-if="!activeWorkflow && activeTask.action === 'repair'" v-model="operationPhase"><option v-if="hasPermission(user, 'repair:create')" value="create">建立送修单</option><option v-if="hasPermission(user, 'repair:receive')" value="accept">维修人员接收</option><option v-if="hasPermission(user, 'repair:update')" value="complete">填写维修结果</option><option v-if="hasPermission(user, 'repair:approve')" value="review">管理处复核</option></select>
+        <select v-if="!activeWorkflow && activeTask.action === 'stocktake'" v-model="operationPhase"><option v-if="hasPermission(user, 'stocktake:submit')" value="create">提交现场盘点</option><option v-if="hasPermission(user, 'stocktake:adjust')" value="adjust">审核盘点差异</option></select>
         <input v-if="activeTask.action === 'shipment'" v-model="logisticsNo" placeholder="物流单号（可选）" />
-        <input v-if="['receiving', 'transfer', 'sales', 'return', 'repair', 'stocktake'].includes(activeTask.action)" v-model="documentNo" placeholder="业务单号（收货/审核/维修/盘点时填写）" />
+        <input v-if="['receiving', 'transfer', 'sales', 'return', 'repair', 'stocktake'].includes(activeTask.action)" v-model="documentNo" :placeholder="activeTask.action === 'repair' && operationPhase === 'create' && activeWorkflow === 'ghana' ? '已接收退回单号（用于分诊，可选）' : activeTask.action === 'receiving' && operationPhase === 'start' ? '深圳发运单号' : '业务单号（收货/审核/维修/盘点时填写）'" />
+        <p v-if="activeTask.action === 'repair' && operationPhase === 'create' && activeWorkflow === 'ghana' && documentNo" class="hint">已接收退回单将从管理处转入维修区；请逐台扫描 IMEI，原退回箱/托盘不要直接搬入。</p>
         <select v-if="activeTask.action === 'receiving'" v-model="accepted"><option :value="true">验收正常</option><option :value="false">异常/待核查</option></select>
         <template v-if="activeTask.action === 'receiving' && operationPhase === 'inspect' && accepted"><input v-model="targetTrayCode" placeholder="重新装入托盘编号（可选）" /><input v-model="targetBoxCode" placeholder="重新装入箱子编号（需填托盘）" /></template>
         <template v-if="activeTask.action === 'sales'">
@@ -656,7 +931,7 @@ onUnmounted(() => { stopCamera(); window.removeEventListener('online', setOnline
         <select v-if="activeTask.action === 'repair' && hasPermission(user, 'repair:approve')" v-model="disposition"><option value="AVAILABLE_AGAIN">恢复可售</option><option value="FROZEN">冻结待核查</option><option value="SCRAPPED">报损</option></select>
         <template v-if="activeTask.action === 'stocktake' && operationPhase === 'adjust'"><select v-model="adjustmentDecision"><option value="IGNORE">忽略差异</option><option value="CONFIRM_MISSING">确认缺失</option><option value="ACCEPT_EXTRA">接收多出</option></select><select v-if="adjustmentDecision === 'ACCEPT_EXTRA'" v-model="adjustmentTargetStatus"><option value="加纳管理处库存">加纳管理处库存</option><option value="门店库存">门店库存</option><option value="可再次销售">可再次销售</option></select></template>
       </div>
-      <div v-if="phaseRequiresScan()" class="manual-row"><input v-model="manualValue" :placeholder="scanMode() === 'imei' ? '手工输入 IMEI' : '输入手机/托盘/箱子编号'" @keyup.enter="addManual" /><button class="secondary" @click="addManual">加入</button></div>
+      <div v-if="phaseRequiresScan()" class="manual-row"><input v-model="manualValue" :placeholder="capturingContainer ? `手工输入目标${activeTask?.action === 'tray' ? '托盘' : '箱子'}编码` : scanMode() === 'imei' ? '手工输入 IMEI' : '输入手机/托盘/箱子编号'" @keyup.enter="addManual" /><button class="secondary" @click="addManual">加入</button></div>
       <div v-if="phaseRequiresScan()" class="scan-summary"><strong>已读取 {{ scanItems.length }} 项</strong><button class="text-button" @click="scanItems = []">清空</button></div>
       <div v-if="phaseRequiresScan()" class="scan-list"><div v-for="item in scanItems" :key="item.value" class="scan-item"><span><strong>{{ item.value }}</strong><small>{{ item.time }} · {{ item.result }}</small></span><button class="remove" @click="removeScan(item.value)">×</button></div><p v-if="!scanItems.length" class="empty-note">暂无扫描结果</p></div>
       <p v-if="operationMessage" class="success">{{ operationMessage }}</p><p v-if="error" class="error">{{ error }}</p>

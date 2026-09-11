@@ -3,7 +3,7 @@
 开发环境启动：
 
 ```bash
-cd /Volumes/little_server/ghanaPhone_management
+cd /Users/jackbond/Desktop/ghana_phone_mgmt
 source .venv/bin/activate
 pip install -r requirements.txt
 cd backend
@@ -20,19 +20,35 @@ uvicorn app.main:app --reload
 
 管理接口还提供 `GET /api/v1/admin/audits`，仅允许具备 `audit:view` 且拥有全局范围的账号查询后台操作审计；销售单据金额只有具备授权报表范围的账号可见。
 
-当前 Alembic head 为 `0008_usernames`，包含幂等记录、盘点差异审核表、后台查询结构和用户名登录字段。
+当前 Alembic head 为 `0010_ghana_role_dispatch_boundary`：除用户名、幂等记录、盘点差异审核表和后台查询结构外，还包含合并岗位元数据、历史角色停用、用户角色迁移，以及“加纳调拨不等于深圳跨境发运”的权限边界。
+
+## 本地演示数据
+
+仓库内的 `scripts/seed_demo_data.py` 会在已迁移的数据库中幂等创建一套
+`DEMO2-` 前缀的深圳—加纳流转样本（手机、托盘、箱、发运/接收/调拨、销售、
+退回、维修、盘点）以及按现场合并岗位配置的演示账号。它只更新自己的演示前缀和演示
+账号，不清空其它业务数据。必须从 `backend` 目录执行，以确保读取当前 `.env`：
+
+```bash
+cd /Users/jackbond/Desktop/ghana_phone_mgmt/backend
+PYTHONPATH=. ../.venv/bin/python scripts/seed_demo_data.py
+```
+
+演示账号统一使用本轮约定的本地测试密码（短密码仅为方便逐岗演示，禁止用于
+生产环境）；既有超级管理员账号不会被该脚本覆盖。用户/角色的功能权限与
+`UserScope` 数据范围会一并写入，收货岗位可按目的地地点看到入站单据。
 
 数据库迁移：
 
 ```bash
-cd /Volumes/little_server/ghanaPhone_management/backend
+cd /Users/jackbond/Desktop/ghana_phone_mgmt/backend
 ../.venv/bin/alembic upgrade head
 ```
 
 初始化或更新超级管理员时，必须显式指定应用数据库连接串；密码在终端隐藏输入，不写入代码或日志：
 
 ```bash
-cd /Volumes/little_server/ghanaPhone_management/backend
+cd /Users/jackbond/Desktop/ghana_phone_mgmt/backend
 PYTHONPATH=. ../.venv/bin/python scripts/bootstrap_super_admin.py \
   --database-url "$DATABASE_URL" --username <管理员用户名>
 ```

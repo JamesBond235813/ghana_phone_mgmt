@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.authorization import get_access_context
 from app.core.access import AccessContext
 from app.core.permissions import PermissionCode, ScopeKind
+from app.core.roles import get_role_metadata
 from app.core.security import hash_password
 from app.db.models import Location, OperationAudit, Organization, Permission, Role, RolePermission, User, UserRole, UserScope
 from app.db.session import get_db
@@ -71,11 +72,16 @@ class RoleInput(BaseModel):
     code: str = Field(min_length=1, max_length=64)
     name: str = Field(min_length=1, max_length=128)
     permission_codes: list[PermissionCode] = Field(default_factory=list)
+    work_group: str | None = Field(default=None, min_length=1, max_length=64)
+    description: str | None = Field(default=None, max_length=512)
 
 
 class RoleUpdateInput(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=128)
     permission_codes: list[PermissionCode] | None = None
+    work_group: str | None = Field(default=None, min_length=1, max_length=64)
+    description: str | None = Field(default=None, max_length=512)
+    is_active: bool | None = None
 
 
 class UserUpdateInput(BaseModel):
@@ -89,8 +95,11 @@ class UserUpdateInput(BaseModel):
 async def validate_user_grants(session: AsyncSession, context: AccessContext, role_ids: list[int] | None, scopes: list[ScopeInput] | None) -> None:
     if role_ids is not None:
         for role_id in role_ids:
-            if await session.get(Role, role_id) is None:
+            role = await session.get(Role, role_id)
+            if role is None:
                 raise HTTPException(status_code=400, detail=f"角色不存在: {role_id}")
+            if not role.is_active:
+                raise HTTPException(status_code=400, detail=f"角色已停用，不能分配: {role_id}")
             role_permissions = await session.scalars(
                 select(Permission.code)
                 .join(RolePermission, RolePermission.permission_id == Permission.id)
@@ -212,10 +221,38 @@ async def audits(
     } for row in await session.scalars(query)]
 
 
+def _role_metadata_payload(role: Role) -> dict[str, object]:
+    metadata = get_role_metadata(role.code)
+    return {
+        "is_active": bool(role.is_active),
+        "work_group": role.work_group or (metadata.work_group if metadata else None),
+        "description": role.description or (metadata.description if metadata else None),
+        "operations": list(metadata.operations) if metadata else [],
+        "legacy_codes": list(metadata.legacy_codes) if metadata else [],
+    }
+
+
+async def _role_permission_codes(session: AsyncSession, role_id: int) -> list[str]:
+    return list(await session.scalars(
+        select(Permission.code)
+        .join(RolePermission, RolePermission.permission_id == Permission.id)
+        .where(RolePermission.role_id == role_id)
+        .order_by(Permission.code)
+    ))
+
+
 @router.post("/roles")
 async def create_role(payload: RoleInput, session: AsyncSession = Depends(get_db), context: AccessContext = Depends(get_access_context)) -> dict[str, object]:
     require_global(context, PermissionCode.ROLE_MANAGE)
-    role = Role(code=payload.code, name=payload.name); session.add(role); await session.flush()
+    metadata = get_role_metadata(payload.code)
+    role = Role(
+        code=payload.code,
+        name=payload.name,
+        is_active=True,
+        work_group=payload.work_group or (metadata.work_group if metadata else None),
+        description=payload.description if payload.description is not None else (metadata.description if metadata else None),
+    )
+    session.add(role); await session.flush()
     permissions = list(await session.scalars(select(Permission).where(Permission.code.in_([str(code) for code in payload.permission_codes])))) if payload.permission_codes else []
     if len(permissions) != len(set(payload.permission_codes)):
         await session.rollback()
@@ -229,20 +266,31 @@ async def create_role(payload: RoleInput, session: AsyncSession = Depends(get_db
     except Exception:
         await session.rollback()
         raise
-    return {"id": role.id, "code": role.code, "name": role.name, "permission_codes": [row.code for row in permissions]}
+    result = {"id": role.id, "code": role.code, "name": role.name, "permission_codes": [row.code for row in permissions]}
+    result.update(_role_metadata_payload(role))
+    return result
 
 
 @router.get("/roles")
-async def roles(session: AsyncSession = Depends(get_db), context: AccessContext = Depends(get_access_context)) -> list[dict[str, object]]:
+async def roles(
+    include_inactive: bool = Query(default=False),
+    session: AsyncSession = Depends(get_db),
+    context: AccessContext = Depends(get_access_context),
+) -> list[dict[str, object]]:
     if not (
         (context.can(PermissionCode.ROLE_MANAGE) and any(scope.kind == ScopeKind.ALL for scope in context.scopes.get(PermissionCode.ROLE_MANAGE, [])))
         or (context.can(PermissionCode.USER_MANAGE) and any(scope.kind == ScopeKind.ALL for scope in context.scopes.get(PermissionCode.USER_MANAGE, [])))
     ):
         raise HTTPException(status_code=403, detail="需要用户或角色管理权限的全局数据范围")
+    role_query = select(Role).order_by(Role.id)
+    if not include_inactive:
+        role_query = role_query.where(Role.is_active.is_(True))
     result=[]
-    for role in await session.scalars(select(Role).order_by(Role.id)):
-        codes=list(await session.scalars(select(Permission.code).join(RolePermission, RolePermission.permission_id == Permission.id).where(RolePermission.role_id == role.id)))
-        result.append({"id":role.id,"code":role.code,"name":role.name,"permission_codes":codes})
+    for role in await session.scalars(role_query):
+        codes = await _role_permission_codes(session, role.id)
+        item = {"id": role.id, "code": role.code, "name": role.name, "permission_codes": codes}
+        item.update(_role_metadata_payload(role))
+        result.append(item)
     return result
 
 
@@ -260,8 +308,22 @@ async def update_role(role_id: int, payload: RoleUpdateInput, session: AsyncSess
         if any(not context.can(PermissionCode(permission.code)) for permission in permissions):
             raise HTTPException(status_code=403, detail="不能授予当前账号没有的权限")
     try:
+        if payload.is_active is False and role.is_active:
+            assigned_active_user = await session.scalar(
+                select(User.id)
+                .join(UserRole, UserRole.user_id == User.id)
+                .where(UserRole.role_id == role.id, User.is_active.is_(True))
+            )
+            if assigned_active_user is not None:
+                raise HTTPException(status_code=409, detail="角色仍分配给启用用户，请先迁移用户后停用")
         if payload.name is not None:
             role.name = payload.name
+        if payload.work_group is not None:
+            role.work_group = payload.work_group
+        if payload.description is not None:
+            role.description = payload.description
+        if payload.is_active is not None:
+            role.is_active = payload.is_active
         if payload.permission_codes is not None:
             await session.execute(delete(RolePermission).where(RolePermission.role_id == role.id))
             for permission in permissions:
@@ -271,7 +333,9 @@ async def update_role(role_id: int, payload: RoleUpdateInput, session: AsyncSess
     except Exception:
         await session.rollback()
         raise
-    return {"id": role.id, "code": role.code, "name": role.name}
+    result = {"id": role.id, "code": role.code, "name": role.name}
+    result.update(_role_metadata_payload(role))
+    return result
 
 
 @router.post("/users")

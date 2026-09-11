@@ -395,6 +395,15 @@ class Role(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     code: Mapped[str] = mapped_column(String(64), unique=True)
     name: Mapped[str] = mapped_column(String(128))
+    # Roles are configuration records that may be retired when an operating
+    # model changes.  Keeping the row (rather than deleting it) preserves the
+    # meaning of historical audit/user-role records and makes role merges
+    # reversible at the data level.  New roles are active by default.
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    # Stable work-group metadata lets clients present a job-oriented workbench
+    # without guessing from a changing set of permission codes.
+    work_group: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    description: Mapped[str | None] = mapped_column(String(512), nullable=True)
 
 
 class Permission(Base):

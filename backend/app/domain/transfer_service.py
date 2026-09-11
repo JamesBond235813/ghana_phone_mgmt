@@ -16,6 +16,7 @@ from app.db.models import (
 from app.domain.container_service import (
     DomainError,
     expand_container,
+    find_phone_by_imei,
     remove_phone_from_tray,
     remove_tray_from_box,
 )
@@ -138,18 +139,29 @@ async def receive_transfer(
         raise DomainError("调拨单不存在或当前不能收货")
     transfer.status = DocumentStatus.RECEIVING
     items = list(await session.scalars(select(TransferItem).where(TransferItem.transfer_order_id == transfer.id)))
-    item_by_imei = {item.imei_snapshot: item for item in items}
-    if len(set(received_imeis)) != len(received_imeis):
-        raise DomainError("收货列表包含重复 IMEI")
-    for imei in received_imeis:
-        item = item_by_imei.get(imei)
+    # Transfer snapshots store canonical IMEI1, but the operator may scan
+    # either label on a dual-SIM handset.  Resolve the identifier to the
+    # immutable phone_id before matching the transfer item, and reject two
+    # aliases for the same handset in one receipt batch.
+    item_by_phone_id = {item.phone_id: item for item in items}
+    seen_identifiers: set[str] = set()
+    seen_phone_ids: set[int] = set()
+    for raw_imei in received_imeis:
+        imei = raw_imei.strip()
+        if imei in seen_identifiers:
+            raise DomainError("收货列表包含重复 IMEI")
+        seen_identifiers.add(imei)
+        phone = await find_phone_by_imei(session, imei)
+        if phone is None:
+            raise DomainError(f"IMEI 不属于当前调拨单: {raw_imei}")
+        if phone.id in seen_phone_ids:
+            raise DomainError(f"收货列表包含同一台手机的多个 IMEI: {raw_imei}")
+        seen_phone_ids.add(phone.id)
+        item = item_by_phone_id.get(phone.id)
         if item is None:
-            raise DomainError(f"IMEI 不属于当前调拨单: {imei}")
+            raise DomainError(f"IMEI 不属于当前调拨单: {raw_imei}")
         if item.received_at is not None:
             continue
-        phone = await session.get(PhoneDevice, item.phone_id)
-        if phone is None:
-            raise DomainError(f"手机记录不存在: {imei}")
         item.received_at = datetime.now(timezone.utc)
         phone.status = PhoneStatus.STORE_STOCK
         phone.current_organization_id = transfer.destination_organization_id

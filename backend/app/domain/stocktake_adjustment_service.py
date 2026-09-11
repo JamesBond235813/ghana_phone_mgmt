@@ -3,8 +3,8 @@ from datetime import datetime, timezone
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.models import InventoryTransaction, PhoneDevice, StocktakeAdjustment, StocktakeItem, StocktakeOrder
-from app.domain.container_service import remove_phone_from_tray
+from app.db.models import InventoryTransaction, StocktakeAdjustment, StocktakeItem, StocktakeOrder
+from app.domain.container_service import find_phone_by_imei, remove_phone_from_tray
 from app.domain.enums import PhoneStatus
 
 
@@ -40,7 +40,7 @@ async def adjust_stocktake(
         ))
         if existing is not None:
             continue
-        phone = await session.scalar(select(PhoneDevice).where((PhoneDevice.imei == imei) | (PhoneDevice.imei2 == imei)))
+        phone = await find_phone_by_imei(session, imei)
         target_status = data.get("target_status")
         if decision == "CONFIRM_MISSING":
             if item.result != "MISSING" or phone is None:

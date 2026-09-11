@@ -10,6 +10,11 @@ export type CurrentUser = {
   display_name: string
   permissions: string[]
   scopes: Record<string, { kind: string; values: string[] }[]>
+  /** Optional server-provided岗位 metadata; older backends omit these fields. */
+  work_group?: string | null
+  role_codes?: string[]
+  work_groups?: string[]
+  roles?: { code?: string; name?: string; work_group?: string | null; operations?: string[] }[] | string[]
 }
 
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
@@ -17,8 +22,12 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers)
   headers.set('Content-Type', 'application/json')
   if ((init.method || 'GET').toUpperCase() === 'POST' && !headers.has('X-Idempotency-Key')) {
-    let key = localStorage.getItem('gh-phone-operation-key')
-    if (!key) { key = crypto.randomUUID?.() || `${Date.now()}-${Math.random()}`; localStorage.setItem('gh-phone-operation-key', key) }
+    // A key explicitly opened by beginOperation()/setOperationKey() spans one
+    // physical workflow operation (and is cleared by endOperation()).  All
+    // other POSTs—login and admin CRUD included—get a one-shot key that is not
+    // persisted, so the next unrelated request can never replay this one.
+    const activeKey = localStorage.getItem('gh-phone-operation-key')
+    const key = activeKey || crypto.randomUUID?.() || `${Date.now()}-${Math.random()}`
     headers.set('X-Idempotency-Key', key)
   }
   if (token) headers.set('Authorization', `Bearer ${token}`)

@@ -79,7 +79,7 @@ async def test_purchase_to_box_and_phone_lookup_flow():
                 "location_id": 10,
                 "supplier": "测试供应商",
                 "items": [
-                    {"imei": "355240577857876", "brand": "Apple", "model": "iPhone 13", "storage": "128GB"}
+                    {"imei": "355240577857876", "imei2": "355240577857884", "brand": "Apple", "model": "iPhone 13", "storage": "128GB"}
                 ],
             },
         )
@@ -118,7 +118,7 @@ async def test_purchase_to_box_and_phone_lookup_flow():
         tray = client.post(
             "/api/v1/inventory/trays",
             headers=headers,
-            json={"code": "TP-SZ-001", "location_id": 10, "imeis": ["355240577857876"]},
+            json={"code": "TP-SZ-001", "location_id": 10, "imeis": ["355240577857884"]},
         )
         assert tray.status_code == 200, tray.text
         assert tray.json()["phone_count"] == 1

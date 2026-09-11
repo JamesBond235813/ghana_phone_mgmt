@@ -9,7 +9,7 @@ from app.api.authorization import require_permission
 from app.core.access import AccessContext
 from app.core.permissions import PermissionCode
 from app.core.idempotency import get_cached_response, save_response
-from app.db.models import RepairOrder
+from app.db.models import RepairOrder, ReturnOrder
 from app.db.session import get_db
 from app.domain.enums import ContainerKind
 from app.domain.repair_service import accept_repair_order, accept_repair, complete_repair, create_repair_order
@@ -58,7 +58,29 @@ async def create_repair(
 ) -> dict[str, object]:
     if not context.can_access(PermissionCode.REPAIR_CREATE, location_id=payload.location_id):
         raise HTTPException(status_code=403, detail="没有该维修地点的建单权限")
-    cached = await get_cached_response(session, key=idempotency_key, user_id=context.user_id, operation="repair_create")
+    # A Ghana return is received at the management office and handed to the
+    # repair area as a second operation.  Require the same operator to hold
+    # the source receive scope before allowing that cross-location hand-off;
+    # a repair-only account must not move an arbitrary return by number.
+    if payload.return_no:
+        linked_return = await session.scalar(
+            select(ReturnOrder).where(ReturnOrder.return_no == payload.return_no)
+        )
+        if (
+            linked_return is not None
+            and linked_return.destination_location_id != payload.location_id
+            and not context.can_access(
+                PermissionCode.RETURN_RECEIVE,
+                location_id=linked_return.destination_location_id,
+            )
+        ):
+            raise HTTPException(status_code=403, detail="跨地点分诊需要退回接收地点权限")
+    try:
+        cached = await get_cached_response(session, key=idempotency_key, user_id=context.user_id, operation="repair_create")
+    except ValueError as exc:
+        # Reusing a key for another request must be a deterministic client
+        # conflict, not an unhandled exception/500.
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     if cached is not None:
         return cached
     try:

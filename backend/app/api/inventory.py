@@ -66,8 +66,15 @@ async def purchase_receipt(
     context: AccessContext = Depends(get_access_context),
     idempotency_key: str | None = Header(default=None, alias="X-Idempotency-Key"),
 ) -> dict[str, object]:
-    if not context.can_access(PermissionCode.PURCHASE_CREATE, organization_id=payload.organization_id):
-        raise HTTPException(status_code=403, detail="没有该组织的采购入库权限")
+    # Purchase intake is a physical station operation.  Check both the
+    # organization and the exact receiving location so an organization-level
+    # grant cannot silently expand into every warehouse in that organization.
+    if not context.can_access(
+        PermissionCode.PURCHASE_CREATE,
+        organization_id=payload.organization_id,
+        location_id=payload.location_id,
+    ):
+        raise HTTPException(status_code=403, detail="没有该采购收货地点的入库权限")
     try:
         cached = await get_cached_response(session, key=idempotency_key, user_id=context.user_id, operation="purchase_receipt")
         if cached is not None:
@@ -113,7 +120,12 @@ async def create_tray(
         tray.current_location_id = payload.location_id
     try:
         for imei in payload.imeis:
-            phone = await session.scalar(select(PhoneDevice).where(PhoneDevice.imei == imei))
+            # Operators may scan either label on a dual-SIM handset.  Keep
+            # the location guard here, but resolve IMEI2 the same way as the
+            # domain container helper and phone lookup endpoint.
+            phone = await session.scalar(
+                select(PhoneDevice).where((PhoneDevice.imei == imei) | (PhoneDevice.imei2 == imei))
+            )
             if phone is None:
                 raise ValueError(f"IMEI 不存在: {imei}")
             if phone.current_location_id != effective_location_id:
@@ -176,8 +188,14 @@ async def get_phone(imei: str, session: AsyncSession = Depends(get_db), context:
         raise HTTPException(status_code=403, detail="没有该手机的查看权限")
     tray = await session.scalar(select(Tray).where(Tray.id == phone.current_tray_id)) if phone.current_tray_id else None
     box = await session.scalar(select(Box).where(Box.id == tray.current_box_id)) if tray and tray.current_box_id else None
+    # Auto-increment ids reflect insertion timing, not necessarily the
+    # physical sequence (a backfill/reconciliation may add an intermediate
+    # event later).  Present the immutable audit timeline in event time order
+    # and use the id only as a deterministic tie-breaker.
     transactions = list(await session.scalars(
-        select(InventoryTransaction).where(InventoryTransaction.phone_id == phone.id).order_by(InventoryTransaction.id)
+        select(InventoryTransaction)
+        .where(InventoryTransaction.phone_id == phone.id)
+        .order_by(InventoryTransaction.created_at, InventoryTransaction.id)
     ))
     return {
         "imei": phone.imei, "brand": phone.brand, "model": phone.model, "storage": phone.storage,

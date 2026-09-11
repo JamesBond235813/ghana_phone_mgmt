@@ -85,3 +85,23 @@ async def test_partial_phone_removal_keeps_remaining_phone_and_container_relatio
         assert {item.imei for item in remaining_box} == {"355240577857877", "355240577857884"}
 
     await engine.dispose()
+
+
+async def test_phone_container_expansion_accepts_imei2_alias():
+    engine, session_factory = await make_session()
+    async with session_factory() as session:
+        primary = "355240577857876"
+        secondary = "355240577857884"
+        phone = PhoneDevice(
+            imei=primary,
+            imei2=secondary,
+            status=PhoneStatus.GHANA_STOCK,
+        )
+        session.add(phone)
+        await session.commit()
+
+        expanded = await expand_container(session, ContainerKind.PHONE, secondary)
+        assert len(expanded) == 1
+        assert expanded[0].id == phone.id
+
+    await engine.dispose()

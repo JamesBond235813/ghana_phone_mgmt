@@ -22,8 +22,25 @@ def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
+async def find_phone_by_imei(session: AsyncSession, imei: str) -> PhoneDevice | None:
+    """Resolve either physical IMEI label to one handset record.
+
+    The scanner may read IMEI1 or IMEI2 depending on which side of a handset
+    label is exposed.  Keeping the lookup in one helper prevents individual
+    receiving/dispatch/return flows from silently reverting to IMEI1-only
+    matching.
+    """
+
+    value = imei.strip()
+    if not value:
+        return None
+    return await session.scalar(
+        select(PhoneDevice).where((PhoneDevice.imei == value) | (PhoneDevice.imei2 == value))
+    )
+
+
 async def get_phone_by_imei(session: AsyncSession, imei: str) -> PhoneDevice:
-    phone = await session.scalar(select(PhoneDevice).where(PhoneDevice.imei == imei))
+    phone = await find_phone_by_imei(session, imei)
     if phone is None:
         raise DomainError(f"IMEI 不存在: {imei}")
     return phone

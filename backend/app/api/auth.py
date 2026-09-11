@@ -10,8 +10,7 @@ from app.core.permissions import PermissionCode
 from app.core.security import create_access_token, hash_password, verify_password
 from app.db.models import Location, Organization, User
 from app.db.session import get_db
-from app.repositories.users import authenticate_password
-from app.repositories.users import build_access_context
+from app.repositories.users import authenticate_password, build_access_context, get_user_role_metadata
 
 
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -54,11 +53,19 @@ async def login_by_password(
     user = await authenticate_password(session, payload.identifier or payload.phone or "", payload.password)
     if user is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="手机号或密码错误")
-    return {
+    role_metadata = await get_user_role_metadata(session, user.id)
+    result: dict[str, object] = {
         "access_token": create_access_token(str(user.id)),
         "token_type": "bearer",
         "user": {"id": user.id, "username": user.username, "phone": user.phone, "display_name": user.display_name},
     }
+    if role_metadata:
+        result["user"]["roles"] = role_metadata
+        result["user"]["role_codes"] = [str(item["code"]) for item in role_metadata]
+        work_groups = sorted({str(item["work_group"]) for item in role_metadata if item.get("work_group")})
+        result["user"]["work_groups"] = work_groups
+        result["user"]["work_group"] = work_groups[0] if len(work_groups) == 1 else None
+    return result
 
 
 @router.patch("/profile")
@@ -112,7 +119,8 @@ async def current_user(
     user: User = Depends(get_current_user), session: AsyncSession = Depends(get_db)
 ) -> dict[str, object]:
     context = await build_access_context(session, user)
-    return {
+    role_metadata = await get_user_role_metadata(session, user.id)
+    result: dict[str, object] = {
         "id": user.id,
         "username": user.username,
         "phone": user.phone,
@@ -125,6 +133,15 @@ async def current_user(
             for permission, scopes in context.scopes.items()
         },
     }
+    # Keep the no-role response backward compatible for lightweight clients,
+    # while exposing canonical role/work-group metadata for real operators.
+    if role_metadata:
+        result["roles"] = role_metadata
+        result["role_codes"] = [str(item["code"]) for item in role_metadata]
+        work_groups = sorted({str(item["work_group"]) for item in role_metadata if item.get("work_group")})
+        result["work_groups"] = work_groups
+        result["work_group"] = work_groups[0] if len(work_groups) == 1 else None
+    return result
 
 
 @router.get("/work-locations")
@@ -158,6 +175,7 @@ async def work_locations(
             "organization_id": organization.id,
             "organization_code": organization.code,
             "organization_name": organization.name,
+            "country": organization.country,
             "code": location.code,
             "name": location.name,
             "location_type": location.location_type,

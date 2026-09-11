@@ -11,6 +11,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.core.permissions import PermissionCode, ScopeKind
+from app.core.roles import ROLE_METADATA
 from app.core.security import hash_password
 from app.db.models import Permission, Role, RolePermission, User, UserRole, UserScope
 
@@ -32,9 +33,22 @@ async def bootstrap(database_url: str, username: str, password: str, display_nam
 
             role = await session.scalar(select(Role).where(Role.code == "super_admin"))
             if role is None:
-                role = Role(code="super_admin", name="超级管理员")
+                metadata = ROLE_METADATA["super_admin"]
+                role = Role(
+                    code="super_admin",
+                    name=metadata.name,
+                    work_group=metadata.work_group,
+                    description=metadata.description,
+                    is_active=True,
+                )
                 session.add(role)
                 await session.flush()
+            else:
+                metadata = ROLE_METADATA["super_admin"]
+                role.name = metadata.name
+                role.work_group = role.work_group or metadata.work_group
+                role.description = role.description or metadata.description
+                role.is_active = True
 
             permission_rows: dict[str, Permission] = {}
             for code in PermissionCode:

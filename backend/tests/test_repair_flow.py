@@ -77,14 +77,26 @@ async def test_returned_phone_repair_and_management_review():
     app.dependency_overrides[get_db] = override_get_db
     try:
         client = TestClient(app)
+        create_headers = {
+            "Authorization": f"Bearer {create_access_token('100')}",
+            "X-Idempotency-Key": "repair-create-replay-001",
+        }
         created = client.post(
             "/api/v1/repairs",
-            headers={"Authorization": f"Bearer {create_access_token('100')}"},
+            headers=create_headers,
             json={"organization_id": 1, "location_id": 10, "return_no": "RET-001", "imeis": ["355240577857876"]},
         )
         assert created.status_code == 200, created.text
         repair_no = created.json()["repair_no"]
         assert created.json()["status"] == "待审核"
+
+        replayed = client.post(
+            "/api/v1/repairs",
+            headers=create_headers,
+            json={"organization_id": 1, "location_id": 10, "return_no": "RET-001", "imeis": ["355240577857876"]},
+        )
+        assert replayed.status_code == 200, replayed.text
+        assert replayed.json() == created.json()
 
         accepted = client.post(
             f"/api/v1/repairs/{repair_no}/accept",

@@ -4,7 +4,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.access import AccessContext, Scope
 from app.core.permissions import PermissionCode, ScopeKind
 from app.core.security import verify_password
-from app.db.models import Permission, RolePermission, User, UserRole, UserScope
+from app.core.roles import get_role_metadata
+from app.db.models import Permission, Role, RolePermission, User, UserRole, UserScope
 
 
 DUMMY_PASSWORD_HASH = (
@@ -38,7 +39,8 @@ async def build_access_context(session: AsyncSession, user: User) -> AccessConte
         select(Permission.code)
         .join(RolePermission, RolePermission.permission_id == Permission.id)
         .join(UserRole, UserRole.role_id == RolePermission.role_id)
-        .where(UserRole.user_id == user.id)
+        .join(Role, Role.id == UserRole.role_id)
+        .where(UserRole.user_id == user.id, Role.is_active.is_(True))
     )
     permission_codes: set[PermissionCode] = set()
     for code in permission_rows:
@@ -61,3 +63,36 @@ async def build_access_context(session: AsyncSession, user: User) -> AccessConte
             Scope(kind, {row.scope_value} if row.scope_value is not None else set())
         )
     return AccessContext(user_id=user.id, permissions=permission_codes, scopes=scopes)
+
+
+async def get_user_role_metadata(
+    session: AsyncSession, user_id: int, *, active_only: bool = True
+) -> list[dict[str, object]]:
+    """Return role/work-group metadata for API clients.
+
+    Permission links remain authoritative for authorization.  This helper is
+    presentation metadata only, but it deliberately hides archived roles by
+    default so a merged legacy role cannot create a second workbench section.
+    """
+
+    query = (
+        select(Role)
+        .join(UserRole, UserRole.role_id == Role.id)
+        .where(UserRole.user_id == user_id)
+        .order_by(Role.id)
+    )
+    if active_only:
+        query = query.where(Role.is_active.is_(True))
+    result: list[dict[str, object]] = []
+    for role in await session.scalars(query):
+        metadata = get_role_metadata(role.code)
+        result.append({
+            "id": role.id,
+            "code": role.code,
+            "name": role.name,
+            "is_active": bool(role.is_active),
+            "work_group": role.work_group or (metadata.work_group if metadata else None),
+            "description": role.description or (metadata.description if metadata else None),
+            "operations": list(metadata.operations) if metadata else [],
+        })
+    return result

@@ -16,7 +16,13 @@ from app.db.models import (
     SalesOrder,
     Tray,
 )
-from app.domain.container_service import DomainError, expand_container, remove_phone_from_tray, remove_tray_from_box
+from app.domain.container_service import (
+    DomainError,
+    expand_container,
+    find_phone_by_imei,
+    remove_phone_from_tray,
+    remove_tray_from_box,
+)
 from app.domain.enums import ContainerKind, DocumentStatus, PhoneStatus
 from app.domain.shipment_service import make_no
 from app.domain.location_guard import require_active_location
@@ -68,6 +74,11 @@ async def create_sale(
         old_status = str(phone.status)
         phone.status = PhoneStatus.SALE_PENDING
         price = prices.get(phone.imei) if prices else None
+        # A handset can be entered by either IMEI label.  Price maps from the
+        # scanner therefore accept IMEI2 as an alias while the order keeps the
+        # canonical IMEI1 snapshot.
+        if price is None and prices and phone.imei2:
+            price = prices.get(phone.imei2)
         if price is not None:
             total += price
         source_tray = await session.get(Tray, phone.current_tray_id) if phone.current_tray_id else None
@@ -164,7 +175,20 @@ async def create_return(
     if sale is None or sale.status != DocumentStatus.COMPLETED:
         raise DomainError("原销售单不存在或尚未完成")
     sold_items = list(await session.scalars(select(SalesItem).where(SalesItem.sales_order_id == sale.id)))
+    sold_by_phone_id = {item.phone_id: item for item in sold_items}
+    # Sales snapshots intentionally remain immutable, while the live phone
+    # record carries both labels.  Add current IMEI1/IMEI2 aliases to the
+    # lookup so a return operator can scan whichever label is visible.
     sold_by_imei = {item.imei_snapshot: item for item in sold_items}
+    if sold_by_phone_id:
+        sold_phones = list(await session.scalars(
+            select(PhoneDevice).where(PhoneDevice.id.in_(sold_by_phone_id))
+        ))
+        for phone in sold_phones:
+            item = sold_by_phone_id[phone.id]
+            for alias in (phone.imei, phone.imei2):
+                if alias:
+                    sold_by_imei[alias] = item
     if containers:
         expanded: dict[str, PhoneDevice] = {}
         for kind, code in containers:
@@ -173,16 +197,23 @@ async def create_return(
         imeis = list(dict.fromkeys([*imeis, *expanded]))
     if not imeis:
         raise DomainError("退回至少需要一台手机")
-    if len(set(imeis)) != len(imeis):
-        raise DomainError("退回列表包含重复 IMEI")
+    seen_identifiers: set[str] = set()
+    seen_phone_ids: set[int] = set()
     phones: list[PhoneDevice] = []
-    for imei in imeis:
+    for raw_imei in imeis:
+        imei = raw_imei.strip()
+        if imei in seen_identifiers:
+            raise DomainError("退回列表包含重复 IMEI")
+        seen_identifiers.add(imei)
         item = sold_by_imei.get(imei)
         if item is None:
-            raise DomainError(f"手机不属于原销售单: {imei}")
+            raise DomainError(f"手机不属于原销售单: {raw_imei}")
+        if item.phone_id in seen_phone_ids:
+            raise DomainError(f"退回列表包含同一台手机的多个 IMEI: {raw_imei}")
+        seen_phone_ids.add(item.phone_id)
         phone = await session.get(PhoneDevice, item.phone_id)
         if phone is None or phone.status != PhoneStatus.SOLD:
-            raise DomainError(f"手机当前不能退回: {imei}")
+            raise DomainError(f"手机当前不能退回: {raw_imei}")
         phones.append(phone)
     if sale.organization_id != source_organization_id or sale.location_id != source_location_id:
         raise DomainError("退回来源必须是原销售门店")
@@ -241,18 +272,25 @@ async def receive_return(
     if order is None or order.status not in {DocumentStatus.IN_TRANSIT, DocumentStatus.PARTIAL}:
         raise DomainError("退回单不存在或当前不能接收")
     items = list(await session.scalars(select(ReturnItem).where(ReturnItem.return_order_id == order.id)))
-    item_by_imei = {item.imei_snapshot: item for item in items}
-    if len(set(received_imeis)) != len(received_imeis):
-        raise DomainError("退回收货列表包含重复 IMEI")
-    for imei in received_imeis:
-        item = item_by_imei.get(imei)
+    item_by_phone_id = {item.phone_id: item for item in items}
+    seen_identifiers: set[str] = set()
+    seen_phone_ids: set[int] = set()
+    for raw_imei in received_imeis:
+        imei = raw_imei.strip()
+        if imei in seen_identifiers:
+            raise DomainError("退回收货列表包含重复 IMEI")
+        seen_identifiers.add(imei)
+        phone = await find_phone_by_imei(session, imei)
+        if phone is None:
+            raise DomainError(f"IMEI 不属于当前退回单: {raw_imei}")
+        if phone.id in seen_phone_ids:
+            raise DomainError(f"退回收货列表包含同一台手机的多个 IMEI: {raw_imei}")
+        seen_phone_ids.add(phone.id)
+        item = item_by_phone_id.get(phone.id)
         if item is None:
-            raise DomainError(f"IMEI 不属于当前退回单: {imei}")
+            raise DomainError(f"IMEI 不属于当前退回单: {raw_imei}")
         if item.received_at is not None:
             continue
-        phone = await session.get(PhoneDevice, item.phone_id)
-        if phone is None:
-            raise DomainError(f"手机记录不存在: {imei}")
         item.received_at = datetime.now(timezone.utc)
         phone.status = PhoneStatus.WAITING_REPAIR
         phone.current_organization_id = order.destination_organization_id
