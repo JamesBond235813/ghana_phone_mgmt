@@ -385,6 +385,11 @@ code { color: #245b55; font-family: "SFMono-Regular", Consolas, "Liberation Mono
 .table-meta { margin: 0 0 8px; color: var(--muted); font-size: 11px; }
 .filter-control { display: grid; gap: 5px; min-width: 0; color: var(--muted); font-size: 10px; font-weight: 900; }
 .filter-control select { width: 100%; }
+/* Inventory filters are frequently used on large monitors. Keep the native
+   select readable while retaining the restrained, utilitarian visual style. */
+.inventory-page .filter-control { font-size: 12px; }
+.inventory-page .filter-control select { min-height: 44px; padding: 9px 13px; font-size: 14px; font-weight: 600; }
+.inventory-page .filter-control select option { font-size: 14px; font-weight: 500; }
 .table-wrap { max-width: 100%; max-height: clamp(220px,calc(100dvh - 445px),560px); overflow: auto; overscroll-behavior: contain; border: 1px solid #e0ece8; border-radius: 10px; background: #fff; scrollbar-gutter: stable; }
 .data-table { width: 100%; min-width: 760px; margin: 0; border-collapse: separate; border-spacing: 0; }
 .data-table th, .data-table td { padding: 12px 13px; text-align: left; border-bottom: 1px solid #e6efed; font-size: 12px; vertical-align: middle; }
